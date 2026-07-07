@@ -917,8 +917,11 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
     const rawClipPath = path.join(tempDir, `raw_${clipId}.mp4`);
     const finalClipPath = path.join(outputDir, `short_${clipId}.mp4`);
 
-    const YTDLP_PATH = `"${path.join(process.cwd(), "yt-dlp.exe")}"`;
-    const FFMPEG_PATH = `"C:\\ffmpeg\\bin\\ffmpeg.exe"`;
+    // Configurable via .env so this isn't locked to a Windows-only path.
+    // Falls back to "yt-dlp"/"ffmpeg" resolved from PATH if not set, which
+    // works out of the box on macOS/Linux (and Windows, if both are on PATH).
+    const YTDLP_PATH = `"${process.env.YTDLP_PATH || path.join(process.cwd(), "yt-dlp.exe")}"`;
+    const FFMPEG_PATH = `"${process.env.FFMPEG_PATH || "ffmpeg"}"`;
 
     try {
       // 1. Queue render process

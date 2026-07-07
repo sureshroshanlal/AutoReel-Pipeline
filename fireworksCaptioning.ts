@@ -64,8 +64,10 @@ export async function extractClipAudio(
   tempDir: string,
   clipId: string
 ): Promise<string> {
-  const YTDLP_PATH = `"${path.join(process.cwd(), "yt-dlp.exe")}"`;
-  const FFMPEG_PATH = `"C:\\ffmpeg\\bin\\ffmpeg.exe"`;
+  // Configurable via .env — see the render endpoint in server.ts for the
+  // same convention. Falls back to PATH-resolved binaries if unset.
+  const YTDLP_PATH = `"${process.env.YTDLP_PATH || path.join(process.cwd(), "yt-dlp.exe")}"`;
+  const FFMPEG_PATH = `"${process.env.FFMPEG_PATH || "ffmpeg"}"`;
 
   const rawAudioPath = path.join(tempDir, `raw_audio_${clipId}.m4a`);
   const wavPath = path.join(tempDir, `asr_${clipId}.wav`);
@@ -91,7 +93,7 @@ export async function extractClipAudio(
     throw new Error("FFmpeg failed to convert clip audio to 16kHz mono WAV.");
   }
 
-  try { fs.unlinkSync(rawAudioPath); } catch {}
+  try { fs.unlinkSync(rawAudioPath); } catch { }
 
   return wavPath;
 }
