@@ -1,0 +1,76 @@
+{
+  "projects": [
+    {
+      "id": "project_xdth62wfk",
+      "youtubeUrl": "https://www.youtube.com/watch?v=_3PYS5oCgvQ",
+      "title": "Highlights | Germany 2-1 Cote d'Ivoire | FIFA World Cup 2026™",
+      "thumbnailUrl": "https://i.ytimg.com/vi/_3PYS5oCgvQ/hqdefault.jpg",
+      "duration": "14:22",
+      "clips": [
+        {
+          "id": "clip_xurwtyk2p",
+          "name": "Short Clip #2",
+          "startTime": "00:00:04",
+          "endTime": "00:00:38",
+          "verticalCrop": {
+            "x": 42,
+            "y": 50,
+            "zoom": 1.2,
+            "colorCorrection": {
+              "brightness": 25,
+              "contrast": 34,
+              "saturation": 39
+            }
+          },
+          "backgroundMusic": "None - Retain Original Audio",
+          "overlayText": "Germany Down By a Goal",
+          "watermarkEnabled": true,
+          "status": "failed",
+          "subtitles": [
+            {
+              "id": "s_gem_1782097945790_0",
+              "startTime": "00:00:00",
+              "endTime": "00:00:06",
+              "text": "Germany takes the lead!"
+            },
+            {
+              "id": "s_gem_1782097945790_1",
+              "startTime": "00:00:07",
+              "endTime": "00:00:13",
+              "text": "Cote d'Ivoire strikes back!"
+            },
+            {
+              "id": "s_gem_1782097945790_2",
+              "startTime": "00:00:14",
+              "endTime": "00:00:22",
+              "text": "An absolute thriller unfolding!"
+            },
+            {
+              "id": "s_gem_1782097945790_3",
+              "startTime": "00:00:23",
+              "endTime": "00:00:30",
+              "text": "Germany finds the winner!"
+            },
+            {
+              "id": "s_gem_1782097945790_4",
+              "startTime": "00:00:31",
+              "endTime": "00:00:34",
+              "text": "Unbelievable World Cup scenes!"
+            }
+          ],
+          "progress": 0
+        }
+      ],
+      "createdAt": "2026-06-22T01:42:53.921Z"
+    }
+  ],
+  "posts": [],
+  "settings": {
+    "instagramEnabled": false,
+    "watermarkText": "@goaliqlive",
+    "watermarkPos": "top-right",
+    "stingerLength": 2,
+    "resolution": "1080x1920",
+    "bitrate": "6"
+  }
+}

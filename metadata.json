@@ -1,0 +1,6 @@
+{
+  "name": "YouTube to Short Video Clipper",
+  "description": "Trim YouTube videos into 9:16 vertical shorts, auto-generate captions using Gemini, add custom background audio, watermarks, brand overlays, and schedule reels.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
