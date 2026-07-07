@@ -30,6 +30,7 @@ export interface Clip {
   overlayText?: string;
   watermarkEnabled?: boolean;
   muteOriginalAudio?: boolean; // Strip source audio, generate TTS voice-over from subtitles
+  subtitlesByLang?: Record<string, Subtitle[]>; // Fireworks-localized caption tracks, keyed by language name
 }
 
 export interface VideoProject {

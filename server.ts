@@ -922,6 +922,10 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
     // works out of the box on macOS/Linux (and Windows, if both are on PATH).
     const YTDLP_PATH = `"${process.env.YTDLP_PATH || path.join(process.cwd(), "yt-dlp.exe")}"`;
     const FFMPEG_PATH = `"${process.env.FFMPEG_PATH || "ffmpeg"}"`;
+    // Only pass --ffmpeg-location when the user explicitly set FFMPEG_PATH.
+    // yt-dlp does its own PATH auto-detection when this flag is omitted, but
+    // given a bare command name it does a literal file-existence check and fails.
+    const ffmpegLocationFlag = process.env.FFMPEG_PATH ? `--ffmpeg-location ${FFMPEG_PATH}` : "";
 
     try {
       // 1. Queue render process
@@ -935,7 +939,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
       updateClipStatus(projectId, clipId, "encoding", 20);
 
       // Download specific range segment using yt-dlp
-      const ytdlCmd = `${YTDLP_PATH} --js-runtimes node -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" --download-sections "*${clip.startTime}-${clip.endTime}" --ffmpeg-location ${FFMPEG_PATH} "${project.youtubeUrl}" -o "${rawClipPath}"`;
+      const ytdlCmd = `${YTDLP_PATH} --js-runtimes node -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" --download-sections "*${clip.startTime}-${clip.endTime}" ${ffmpegLocationFlag} "${project.youtubeUrl}" -o "${rawClipPath}"`;
       await runCmd(ytdlCmd);
 
       if (!fs.existsSync(rawClipPath)) {
@@ -1022,7 +1026,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
 
       // Write filter chain to a temp file (avoids all shell-quoting issues)
       const filterFile = path.join(tempDir, `filter_${clipId}.txt`);
-      fs.writeFileSync(filterFile, filterchain.join("\n"), "utf-8");
+      fs.writeFileSync(filterFile, filterchain.join(",\n"), "utf-8");
       console.log(`[ReelGenie Render] Filter chain:\n${filterchain.join(",\n  ")}`);
 
       const br = currentSettings.bitrate || "6";
@@ -1098,7 +1102,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
           ? `-i "${voiceTrackPath}" -map 0:v:0 -map 1:a:0 -c:a aac -shortest`          // TTS voice-over
           : `-an`;                                                                       // muted, no subtitles
 
-      const ffmpegCmd = `${FFMPEG_PATH} -y -i "${rawClipPath}" ${audioArg} -filter_script "${filterFile}" -c:v libx264 -preset fast -b:v ${br}M -maxrate ${br}M -bufsize 12M -pix_fmt yuv420p "${finalClipPath}"`;
+      const ffmpegCmd = `${FFMPEG_PATH} -y -i "${rawClipPath}" ${audioArg} -filter_script:v "${filterFile}" -c:v libx264 -preset fast -b:v ${br}M -maxrate ${br}M -bufsize 12M -pix_fmt yuv420p "${finalClipPath}"`;
 
       updateClipStatus(projectId, clipId, "encoding", 85);
       console.log(`[ReelGenie Render] FFmpeg command:\n${ffmpegCmd}`);

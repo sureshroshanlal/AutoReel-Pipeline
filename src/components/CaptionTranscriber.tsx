@@ -21,6 +21,12 @@ export default function CaptionTranscriber({
   const [editVal, setEditVal] = useState("");
   const [burnedStyle, setBurnedStyle] = useState("yellow-pop");
 
+  // Localization states
+  const [targetLanguage, setTargetLanguage] = useState("Spanish");
+  const [localizing, setLocalizing] = useState(false);
+  const [localizeError, setLocalizeError] = useState("");
+  const [viewLang, setViewLang] = useState("Original");
+
   // Summary generation states
   const [summaryFormat, setSummaryFormat] = useState<"paragraph" | "bullets">("bullets");
   const [generatedSummary, setGeneratedSummary] = useState("");
@@ -122,6 +128,65 @@ export default function CaptionTranscriber({
     onPostSuggestedDetails(generatedSummary, ["highlights", "shorts", "reels", "insights", "education"]);
   };
 
+  // Reset the language view whenever the selected clip changes, so we don't
+  // show a stale localized track from a different clip.
+  React.useEffect(() => {
+    setViewLang("Original");
+    setLocalizeError("");
+  }, [activeClip?.id]);
+
+  // Trigger Fireworks-powered localization of the real transcript into another language
+  const triggerLocalization = async () => {
+    if (!activeClip.subtitles || activeClip.subtitles.length === 0) return;
+    setLocalizing(true);
+    setLocalizeError("");
+    try {
+      const res = await fetch(
+        `/api/projects/${selectedProject.id}/clips/${activeClip.id}/localize`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ targetLanguage })
+        }
+      );
+      const data = await res.json();
+      if (res.ok) {
+        const updatedByLang = { ...(activeClip.subtitlesByLang || {}), [targetLanguage]: data.subtitles };
+        onUpdateClip({ subtitlesByLang: updatedByLang });
+        setViewLang(targetLanguage);
+      } else {
+        setLocalizeError(data.error || "Localization failed.");
+      }
+    } catch (e) {
+      console.error(e);
+      setLocalizeError("Localization request failed.");
+    } finally {
+      setLocalizing(false);
+    }
+  };
+
+  // Swap the burned-in / render subtitle track to whichever language is
+  // currently being previewed. Keeps the English original safely stored in
+  // subtitlesByLang first, so it's never lost.
+  const useLangForRender = (lang: string) => {
+    if (lang === "Original") return;
+    const localizedTrack = activeClip.subtitlesByLang?.[lang];
+    if (!localizedTrack) return;
+
+    const preservedByLang = { ...(activeClip.subtitlesByLang || {}) };
+    if (!preservedByLang["Original"]) {
+      preservedByLang["Original"] = activeClip.subtitles;
+    }
+    onUpdateClip({ subtitles: localizedTrack, subtitlesByLang: preservedByLang });
+    setViewLang("Original"); // now that it's active, treat it as the new "original" view
+  };
+
+  const availableLangs = ["Original", ...Object.keys(activeClip.subtitlesByLang || {})];
+  const displayedSubtitles =
+    viewLang === "Original" ? activeClip.subtitles : activeClip.subtitlesByLang?.[viewLang] || [];
+
+  const LOCALIZE_LANGUAGE_OPTIONS = ["Spanish", "Hindi", "Portuguese", "French", "Arabic", "German", "Japanese"];
+
   // Save modified subtitles
   const saveSubtitleEdit = (subId: string) => {
     const updated = activeClip.subtitles.map((sub) => {
@@ -181,17 +246,93 @@ export default function CaptionTranscriber({
           </div>
         </div>
 
+        {/* Fireworks AI Localization — translate real captions into another language */}
+        <div className="bg-orange-500/10 p-4 rounded-2xl border border-orange-500/20 space-y-2.5 shadow-sm">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h4 className="text-xs font-bold text-white flex items-center gap-1 font-display">
+                <Flame className="w-3.5 h-3.5 text-orange-400" />
+                <span>Localize Captions (Fireworks AI)</span>
+              </h4>
+              <p className="text-[10px] text-slate-400">Translate the real transcript for a global audience</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                id="localize-target-lang"
+                value={targetLanguage}
+                onChange={(e) => setTargetLanguage(e.target.value)}
+                className="text-xs font-bold text-white bg-black/40 border border-white/10 rounded-lg px-2 py-1.5 outline-none cursor-pointer"
+              >
+                {LOCALIZE_LANGUAGE_OPTIONS.map((lang) => (
+                  <option key={lang} value={lang} className="bg-slate-900 text-white">{lang}</option>
+                ))}
+              </select>
+              <button
+                id="btn-trigger-localize"
+                onClick={triggerLocalization}
+                disabled={localizing || activeClip.subtitles.length === 0}
+                className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 text-white rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all shadow-md shadow-orange-600/25 cursor-pointer disabled:bg-slate-800 disabled:text-slate-400 whitespace-nowrap"
+              >
+                {localizing ? (
+                  <>
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    <span>Translating...</span>
+                  </>
+                ) : (
+                  <span>Localize</span>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {activeClip.subtitles.length === 0 && (
+            <p className="text-[10px] text-amber-300">Run "Whisper Auto-Transcribe" first — localization needs real captions to translate.</p>
+          )}
+          {localizeError && (
+            <p className="text-[10px] text-red-400">⚠️ {localizeError}</p>
+          )}
+
+          {availableLangs.length > 1 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+              {availableLangs.map((lang) => (
+                <button
+                  key={lang}
+                  id={`btn-view-lang-${lang}`}
+                  onClick={() => setViewLang(lang)}
+                  className={`text-[9px] uppercase font-black px-2 py-1 rounded transition-all cursor-pointer ${viewLang === lang ? "bg-orange-600 text-white" : "bg-black/30 text-slate-400 hover:text-white border border-white/10"
+                    }`}
+                >
+                  {lang}
+                </button>
+              ))}
+              {viewLang !== "Original" && (
+                <button
+                  id="btn-use-lang-for-render"
+                  onClick={() => useLangForRender(viewLang)}
+                  className="text-[9px] uppercase font-black px-2 py-1 rounded bg-emerald-600 text-white hover:bg-emerald-500 transition-all cursor-pointer"
+                  title="Burn this language's captions in when rendering"
+                >
+                  Use for Render
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         {/* Burned-in subtitles editor list */}
         <div className="space-y-2">
-          <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-display">Burned-in Captions (Editable)</h3>
-          {activeClip.subtitles.length === 0 ? (
+          <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-display">
+            Burned-in Captions (Editable) {viewLang !== "Original" && <span className="text-orange-400 normal-case font-medium">— previewing {viewLang}</span>}
+          </h3>
+          {displayedSubtitles.length === 0 ? (
             <div className="text-center py-6 bg-white/5 rounded-xl border border-dashed border-white/10">
               <p className="text-xs text-slate-400">Click auto transmit above to hear and map subtitle overlays.</p>
             </div>
           ) : (
             <div className="max-h-48 overflow-y-auto space-y-2 border border-white/10 rounded-xl p-2 bg-black/30">
-              {activeClip.subtitles.map((sub) => {
+              {displayedSubtitles.map((sub) => {
                 const isEditing = editingSubId === sub.id;
+                const canEdit = viewLang === "Original"; // Editing only applies to the live render track
                 return (
                   <div key={sub.id} className="flex items-center justify-between p-2 rounded-lg bg-white/5 border border-white/10">
                     <div className="flex-1 mr-2">
@@ -213,25 +354,27 @@ export default function CaptionTranscriber({
                     </div>
 
                     <div>
-                      {isEditing ? (
-                        <button
-                          id={`btn-save-sub-${sub.id}`}
-                          onClick={() => saveSubtitleEdit(sub.id)}
-                          className="text-emerald-400 hover:text-emerald-300 p-1"
-                        >
-                          <Check className="w-3.5 h-3.5" />
-                        </button>
-                      ) : (
-                        <button
-                          id={`btn-edit-sub-${sub.id}`}
-                          onClick={() => {
-                            setEditingSubId(sub.id);
-                            setEditVal(sub.text);
-                          }}
-                          className="text-slate-400 hover:text-indigo-400 p-1"
-                        >
-                          <Edit className="w-3.5 h-3.5" />
-                        </button>
+                      {canEdit && (
+                        isEditing ? (
+                          <button
+                            id={`btn-save-sub-${sub.id}`}
+                            onClick={() => saveSubtitleEdit(sub.id)}
+                            className="text-emerald-400 hover:text-emerald-300 p-1"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <button
+                            id={`btn-edit-sub-${sub.id}`}
+                            onClick={() => {
+                              setEditingSubId(sub.id);
+                              setEditVal(sub.text);
+                            }}
+                            className="text-slate-400 hover:text-indigo-400 p-1"
+                          >
+                            <Edit className="w-3.5 h-3.5" />
+                          </button>
+                        )
                       )}
                     </div>
                   </div>
@@ -240,6 +383,7 @@ export default function CaptionTranscriber({
             </div>
           )}
         </div>
+
 
         {/* AI Social Caption Generator */}
         <div className="bg-indigo-500/10 p-4 rounded-2xl border border-indigo-500/20 space-y-2.5 shadow-sm">
@@ -272,15 +416,14 @@ export default function CaptionTranscriber({
               </h4>
               <p className="text-[10px] text-slate-400">Condense ASR dialogue into social previews or bullets</p>
             </div>
-            
+
             <div className="flex items-center gap-1.5 bg-black/40 p-1 rounded-lg border border-white/5 self-start sm:self-auto">
               <button
                 id="btn-format-bullets"
                 type="button"
                 onClick={() => setSummaryFormat("bullets")}
-                className={`text-[9px] uppercase font-black px-2 py-1 rounded transition-all cursor-pointer ${
-                  summaryFormat === "bullets" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
-                }`}
+                className={`text-[9px] uppercase font-black px-2 py-1 rounded transition-all cursor-pointer ${summaryFormat === "bullets" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
+                  }`}
               >
                 Bullets
               </button>
@@ -288,9 +431,8 @@ export default function CaptionTranscriber({
                 id="btn-format-paragraph"
                 type="button"
                 onClick={() => setSummaryFormat("paragraph")}
-                className={`text-[9px] uppercase font-black px-2 py-1 rounded transition-all cursor-pointer ${
-                  summaryFormat === "paragraph" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
-                }`}
+                className={`text-[9px] uppercase font-black px-2 py-1 rounded transition-all cursor-pointer ${summaryFormat === "paragraph" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white"
+                  }`}
               >
                 Paragraph
               </button>
@@ -329,7 +471,7 @@ export default function CaptionTranscriber({
                   <div className="text-xs text-slate-200 font-medium whitespace-pre-line leading-relaxed selection:bg-indigo-500/30">
                     {generatedSummary}
                   </div>
-                  
+
                   <div className="flex items-center gap-2 border-t border-white/5 pt-2">
                     <button
                       id="btn-copy-summary"

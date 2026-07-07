@@ -1,22 +1,17 @@
 // fireworksCaptioning.ts
 // Real ASR + multi-language localization for AutoReel-Pipeline, powered by
 // Fireworks AI (running on AMD Instinct GPUs) — AMD Developer Hackathon: ACT II
-//
-// Replaces the old "Gemini simulates plausible subtitles from the title" flow
-// with genuine Whisper transcription of the actual clip audio, plus optional
-// translation into other languages using a Fireworks-hosted LLM.
 
 import path from "path";
 import fs from "fs";
 import { exec } from "child_process";
-
-const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY || "";
+import { GoogleGenAI } from "@google/genai";
 
 // Fireworks deprecated the old api.fireworks.ai audio route in June 2026.
 // Current serverless endpoints (per Fireworks docs, July 2026):
 //   whisper-v3        -> https://audio-prod.api.fireworks.ai
 //   whisper-v3-turbo  -> https://audio-turbo.api.fireworks.ai
-const FIREWORKS_AUDIO_BASE = "https://audio-turbo.api.fireworks.ai/v1/audio/transcriptions";
+const FIREWORKS_AUDIO_BASE = "https://api.fireworks.ai/inference/v1/audio/transcriptions";
 const FIREWORKS_CHAT_URL = "https://api.fireworks.ai/inference/v1/chat/completions";
 const FIREWORKS_TRANSLATE_MODEL = "accounts/fireworks/models/llama-v3p1-8b-instruct";
 
@@ -68,6 +63,10 @@ export async function extractClipAudio(
   // same convention. Falls back to PATH-resolved binaries if unset.
   const YTDLP_PATH = `"${process.env.YTDLP_PATH || path.join(process.cwd(), "yt-dlp.exe")}"`;
   const FFMPEG_PATH = `"${process.env.FFMPEG_PATH || "ffmpeg"}"`;
+  // Only pass --ffmpeg-location when the user explicitly set FFMPEG_PATH.
+  // yt-dlp does its own PATH auto-detection when this flag is omitted, but
+  // given a bare command name it does a literal file-existence check and fails.
+  const ffmpegLocationFlag = process.env.FFMPEG_PATH ? `--ffmpeg-location ${FFMPEG_PATH}` : "";
 
   const rawAudioPath = path.join(tempDir, `raw_audio_${clipId}.m4a`);
   const wavPath = path.join(tempDir, `asr_${clipId}.wav`);
@@ -75,18 +74,16 @@ export async function extractClipAudio(
   if (fs.existsSync(rawAudioPath)) fs.unlinkSync(rawAudioPath);
   if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath);
 
-  // 1. Pull just the audio for the clip's time range
-  const ytdlCmd = `${YTDLP_PATH} --js-runtimes node -f "bestaudio[ext=m4a]/bestaudio" --download-sections "*${startTime}-${endTime}" --ffmpeg-location ${FFMPEG_PATH} "${youtubeUrl}" -o "${rawAudioPath}"`;
+  // 1. Pull the entire audio track for the video
+  const ytdlCmd = `${YTDLP_PATH} --js-runtimes node -f "bestaudio[ext=m4a]/bestaudio" ${ffmpegLocationFlag} "${youtubeUrl}" -o "${rawAudioPath}"`;
   await runCmd(ytdlCmd);
 
   if (!fs.existsSync(rawAudioPath)) {
     throw new Error("yt-dlp failed to extract clip audio for transcription.");
   }
 
-  // 2. Fireworks recommends pre-converting to 16kHz mono 16-bit PCM for best
-  //    performance — do that conversion ourselves rather than relying on
-  //    their server-side resample step.
-  const convertCmd = `${FFMPEG_PATH} -y -i "${rawAudioPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavPath}"`;
+  // 2. Crop and convert to 16kHz mono 16-bit PCM WAV using FFmpeg
+  const convertCmd = `${FFMPEG_PATH} -y -ss ${startTime} -to ${endTime} -i "${rawAudioPath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavPath}"`;
   await runCmd(convertCmd);
 
   if (!fs.existsSync(wavPath)) {
@@ -107,35 +104,63 @@ export async function transcribeClipAudio(
   audioPath: string,
   opts: { language?: string } = {}
 ): Promise<Subtitle[]> {
-  if (!FIREWORKS_API_KEY) {
-    throw new Error("FIREWORKS_API_KEY is not set in .env");
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not set in .env");
   }
 
-  const fileBuffer = fs.readFileSync(audioPath);
-  const form = new FormData();
-  form.append(
-    "file",
-    new Blob([fileBuffer], { type: "audio/wav" }),
-    path.basename(audioPath)
-  );
-  form.append("model", "whisper-v3-turbo");
-  form.append("response_format", "srt");
-  form.append("vad_model", "silero");
-  if (opts.language) form.append("language", opts.language);
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-  const res = await fetch(FIREWORKS_AUDIO_BASE, {
-    method: "POST",
-    headers: { Authorization: FIREWORKS_API_KEY },
-    body: form,
+  console.log(`[Gemini ASR] Uploading audio file for transcription: ${audioPath}`);
+  const uploadResult = await ai.files.upload({
+    file: audioPath,
+    config: {
+      mimeType: "audio/wav",
+    }
   });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Fireworks transcription failed (${res.status}): ${errText}`);
-  }
+  console.log(`[Gemini ASR] Generating SRT subtitles using gemini-3.5-flash...`);
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Please transcribe the audio and generate SRT formatted subtitles. 
+Ensure each subtitle block has:
+1. An index number (starting from 1)
+2. Start and end times in SRT format (HH:MM:SS,mmm)
+3. The transcribed text
+Ensure output is ONLY the raw SRT subtitle content. Do not include markdown code block formatting (e.g. \`\`\`srt) or any introductory/concluding text.`
+            },
+            {
+              fileData: {
+                fileUri: uploadResult.uri,
+                mimeType: uploadResult.mimeType,
+              }
+            }
+          ]
+        }
+      ]
+    });
 
-  const srtText = await res.text();
-  return parseSrt(srtText);
+    let srtText = response.text || "";
+    srtText = srtText.trim();
+    if (srtText.startsWith("```")) {
+      srtText = srtText.replace(/^```[a-zA-Z]*\n/, "");
+      srtText = srtText.replace(/\n```$/, "");
+    }
+
+    console.log(`[Gemini ASR] ✅ Transcription generated successfully.`);
+    return parseSrt(srtText);
+  } finally {
+    // Cleanup uploaded file asynchronously to avoid taking up quota
+    ai.files.delete({ name: uploadResult.name }).catch((err) => {
+      console.warn("[Gemini ASR] Failed to clean up file from Gemini workspace:", err.message || err);
+    });
+  }
 }
 
 /** Parse standard SRT text into our Subtitle[] shape. */
@@ -177,6 +202,7 @@ export async function translateSubtitles(
   subtitles: Subtitle[],
   targetLanguage: string
 ): Promise<Subtitle[]> {
+  const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY || "";
   if (!FIREWORKS_API_KEY) {
     throw new Error("FIREWORKS_API_KEY is not set in .env");
   }
