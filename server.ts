@@ -6,6 +6,7 @@ import { Readable } from "stream";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { extractClipAudio, transcribeClipAudio, translateSubtitles } from "./fireworksCaptioning";
 
 // Load environment variables
 dotenv.config();
@@ -51,7 +52,7 @@ async function generateContentWithRetry(params: any, retries = 2, delayMs = 600)
       lastError = e;
       const statusCode = e.status || (e.error && e.error.code) || (e.error && e.error.status) || 0;
       console.warn(`Gemini generation attempt ${attempt + 1} failed (Status: ${statusCode}):`, e.message || e);
-      
+
       // If it's a 404 or 400 bad request, don't retry as it is a permanent parameter error
       if (statusCode === 404 || statusCode === 400) {
         break;
@@ -112,6 +113,7 @@ interface Clip {
   overlayText?: string;
   watermarkEnabled?: boolean;
   muteOriginalAudio?: boolean; // Strip source audio, generate TTS voice-over from subtitles
+  subtitlesByLang?: Record<string, Subtitle[]>; // Fireworks-localized caption tracks, keyed by language name
 }
 
 interface VideoProject {
@@ -319,7 +321,7 @@ app.post("/api/youtube/import", async (req, res) => {
     const match2 = cleanUrl.match(/\/shorts\/([^"&?\/\s]{11})/i);
     const match3 = cleanUrl.match(/\/live\/([^"&?\/\s]{11})/i);
     const match4 = cleanUrl.match(/v=([^"&?\/\s]{11})/i);
-    
+
     if (match2 && match2[1]) {
       videoId = match2[1];
       isUrl = true;
@@ -573,10 +575,12 @@ app.put("/api/projects/:projectId/clips/:clipId", (req, res) => {
   res.json({ success: true, clip });
 });
 
-// 6. Gemini Subtitle Generator (Whiper ASR simulation from script context)
+// 6. Fireworks AI Real Transcription (Whisper-v3-turbo on AMD Instinct GPUs)
+// Replaces the old Gemini "simulate plausible subtitles from the title" flow
+// with genuine ASR run on the clip's actual audio.
 app.post("/api/projects/:projectId/clips/:clipId/transcribe", async (req, res) => {
   const { projectId, clipId } = req.params;
-  const { videoTitle, clipContext } = req.body;
+  const { language } = req.body; // optional source-language hint, e.g. "en"
 
   const db = getDB();
   const project = db.projects.find(p => p.id === projectId);
@@ -585,64 +589,44 @@ app.post("/api/projects/:projectId/clips/:clipId/transcribe", async (req, res) =
   const clip = project.clips.find(c => c.id === clipId);
   if (!clip) return res.status(404).json({ error: "Clip not found" });
 
-  // API QUOTA GUARD: If subtitles already exist on this clip, return cached version
-  // without calling Gemini again. User can force-regenerate by clearing subtitles first.
+  // API QUOTA / COST GUARD: If subtitles already exist, return cached version.
+  // User can force-regenerate by clearing subtitles first.
   if (clip.subtitles && clip.subtitles.length > 0) {
-    console.log(`[ReelGenie] Returning cached subtitles for clip ${clipId} (${clip.subtitles.length} lines). Skipping Gemini call to save quota.`);
+    console.log(`[ReelGenie] Returning cached subtitles for clip ${clipId} (${clip.subtitles.length} lines). Skipping Fireworks call.`);
     return res.json({ success: true, subtitles: clip.subtitles, cached: true });
   }
 
   clip.status = "encoding";
   saveDB(db);
 
-  // Default fallback subtitles (used if Gemini is unavailable)
+  const tempDir = path.join(process.cwd(), "output", "temp");
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  // Fallback subtitles used only if Fireworks is unreachable/misconfigured,
+  // so the pipeline degrades gracefully instead of hard-failing a demo.
   let generatedSubtitles: Subtitle[] = [
-    { id: "s_sim_1", startTime: "00:00:01", endTime: "00:00:04", text: "Watch this incredible moment!" },
-    { id: "s_sim_2", startTime: "00:00:05", endTime: "00:00:09", text: "You won't believe what happens next." },
-    { id: "s_sim_3", startTime: "00:00:10", endTime: "00:00:14", text: "Follow for more highlights like this!" }
+    { id: "s_fallback_1", startTime: "00:00:01", endTime: "00:00:04", text: "Watch this incredible moment!" },
+    { id: "s_fallback_2", startTime: "00:00:05", endTime: "00:00:09", text: "You won't believe what happens next." },
+    { id: "s_fallback_3", startTime: "00:00:10", endTime: "00:00:14", text: "Follow for more highlights like this!" }
   ];
 
-  if (ai) {
-    try {
-      // Calculate clip duration in seconds to guide Gemini on timing
-      const parseSec = (t: string) => { const p = t.split(":").map(Number); return p.length === 3 ? p[0]*3600+p[1]*60+p[2] : p[0]*60+p[1]; };
-      const clipDurSec = parseSec(clip.endTime) - parseSec(clip.startTime);
+  try {
+    console.log(`[Fireworks ASR] Extracting clip audio for ${clip.startTime}-${clip.endTime}...`);
+    const audioPath = await extractClipAudio(project.youtubeUrl, clip.startTime, clip.endTime, tempDir, clipId);
 
-      const response = await generateContentWithRetry({
-        model: "gemini-2.0-flash",
-        contents: `YouTube video: "${videoTitle}". Clip: "${clip.name}" (${clip.startTime} to ${clip.endTime}, ${clipDurSec}s long).
-Create 4-5 punchy, TikTok-style subtitle lines that fit WITHIN ${clipDurSec} seconds total.
-Each line: 3-6 words, engaging and hook-driven. Times must be relative to clip start (00:00:00).
-Return JSON array only: [{"startTime":"00:00:00","endTime":"00:00:03","text":"text here"}]`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                startTime: { type: Type.STRING },
-                endTime: { type: Type.STRING },
-                text: { type: Type.STRING }
-              },
-              required: ["startTime", "endTime", "text"]
-            }
-          }
-        }
-      });
+    console.log(`[Fireworks ASR] Transcribing via whisper-v3-turbo...`);
+    const realSubtitles = await transcribeClipAudio(audioPath, { language });
 
-      const list = JSON.parse(response.text || "[]");
-      if (Array.isArray(list) && list.length > 0) {
-        generatedSubtitles = list.map((item, i) => ({
-          id: `s_gem_${Date.now()}_${i}`,
-          startTime: item.startTime,
-          endTime: item.endTime,
-          text: item.text
-        }));
-      }
-    } catch (e) {
-      console.error("Gemini Transcription failed, using fallback subtitles:", e);
+    if (realSubtitles.length > 0) {
+      generatedSubtitles = realSubtitles;
+      console.log(`[Fireworks ASR] ✅ Got ${realSubtitles.length} real subtitle line(s).`);
+    } else {
+      console.warn(`[Fireworks ASR] Transcription returned no lines (silent clip?) — using fallback.`);
     }
+
+    try { fs.unlinkSync(audioPath); } catch { }
+  } catch (e: any) {
+    console.error("[Fireworks ASR] Transcription failed, using fallback subtitles:", e.message || e);
   }
 
   clip.subtitles = generatedSubtitles;
@@ -650,6 +634,47 @@ Return JSON array only: [{"startTime":"00:00:00","endTime":"00:00:03","text":"te
   saveDB(db);
 
   res.json({ success: true, subtitles: generatedSubtitles });
+});
+
+// 6.1. Fireworks AI Localization — translate an existing (real) subtitle
+// track into another language for global-audience distribution.
+app.post("/api/projects/:projectId/clips/:clipId/localize", async (req, res) => {
+  const { projectId, clipId } = req.params;
+  const { targetLanguage } = req.body; // e.g. "Spanish", "Hindi", "Portuguese"
+
+  if (!targetLanguage) {
+    return res.status(400).json({ error: "targetLanguage is required, e.g. 'Spanish'." });
+  }
+
+  const db = getDB();
+  const project = db.projects.find(p => p.id === projectId);
+  if (!project) return res.status(404).json({ error: "Project not found" });
+
+  const clip = project.clips.find(c => c.id === clipId);
+  if (!clip) return res.status(404).json({ error: "Clip not found" });
+
+  if (!clip.subtitles || clip.subtitles.length === 0) {
+    return res.status(400).json({ error: "Run Auto-Transcribe first — no subtitles to localize." });
+  }
+
+  // Cache guard: skip re-translating if we already have this language.
+  if (clip.subtitlesByLang && clip.subtitlesByLang[targetLanguage]) {
+    return res.json({ success: true, subtitles: clip.subtitlesByLang[targetLanguage], cached: true });
+  }
+
+  try {
+    console.log(`[Fireworks Localize] Translating ${clip.subtitles.length} line(s) to ${targetLanguage}...`);
+    const localized = await translateSubtitles(clip.subtitles, targetLanguage);
+
+    clip.subtitlesByLang = clip.subtitlesByLang || {};
+    clip.subtitlesByLang[targetLanguage] = localized;
+    saveDB(db);
+
+    res.json({ success: true, subtitles: localized });
+  } catch (e: any) {
+    console.error("[Fireworks Localize] Translation failed:", e.message || e);
+    res.status(500).json({ error: `Localization failed: ${e.message || e}` });
+  }
 });
 
 // 7. Gemini Instagram Caption & Hashtags Generator
@@ -702,33 +727,33 @@ app.post("/api/trending-audio", async (req, res) => {
   const clipDuration = typeof duration === "number" ? duration : 15;
 
   let trending = [
-    { 
-      name: "MILLION DOLLAR BABY - Tommy Richman", 
-      mood: "Retro R&B Vibe", 
-      suitability: "High-impact beat drops and rhythmic synths, perfect for fast-paced 9:16 clip cuts.", 
-      aspectMatch: "Excellent dynamic cues for vertical movement reframing", 
-      durationMatch: true 
+    {
+      name: "MILLION DOLLAR BABY - Tommy Richman",
+      mood: "Retro R&B Vibe",
+      suitability: "High-impact beat drops and rhythmic synths, perfect for fast-paced 9:16 clip cuts.",
+      aspectMatch: "Excellent dynamic cues for vertical movement reframing",
+      durationMatch: true
     },
-    { 
-      name: "Espresso - Sabrina Carpenter", 
-      mood: "Upbeat Fun Pop", 
-      suitability: "Bouncy, stylish energy, excellent for aesthetic, cooking, or design loop previews.", 
-      aspectMatch: "Great flow for eye-level vertical visual sequences", 
-      durationMatch: true 
+    {
+      name: "Espresso - Sabrina Carpenter",
+      mood: "Upbeat Fun Pop",
+      suitability: "Bouncy, stylish energy, excellent for aesthetic, cooking, or design loop previews.",
+      aspectMatch: "Great flow for eye-level vertical visual sequences",
+      durationMatch: true
     },
-    { 
-      name: "Pedro (Phonk Remix) - Jaxomy", 
-      mood: "Fast-Paced Phonk Tech", 
-      suitability: "Intense synth progression and driving kick, perfect for gaming or fast woodworking loops.", 
-      aspectMatch: "Best for synchronous action reframing center shifts", 
-      durationMatch: true 
+    {
+      name: "Pedro (Phonk Remix) - Jaxomy",
+      mood: "Fast-Paced Phonk Tech",
+      suitability: "Intense synth progression and driving kick, perfect for gaming or fast woodworking loops.",
+      aspectMatch: "Best for synchronous action reframing center shifts",
+      durationMatch: true
     },
-    { 
-      name: "End of Beginning - Djo", 
-      mood: "Cinematic Dreamy Indie", 
-      suitability: "Nostalgic synth pad building up, ideal for slow-motion, landscape-to-portrait zooms with high emotional delivery.", 
-      aspectMatch: "Ideal for slow focal pan and zoom transitions", 
-      durationMatch: true 
+    {
+      name: "End of Beginning - Djo",
+      mood: "Cinematic Dreamy Indie",
+      suitability: "Nostalgic synth pad building up, ideal for slow-motion, landscape-to-portrait zooms with high emotional delivery.",
+      aspectMatch: "Ideal for slow focal pan and zoom transitions",
+      durationMatch: true
     }
   ];
 
@@ -791,7 +816,7 @@ Return a valid JSON holding an object with key "tracks" containing the list. Key
 // 7.2. Gemini Video Transcript Summarizer & Talking Point Extractor
 app.post("/api/transcript/summary", async (req, res) => {
   const { transcript, format } = req.body;
-  
+
   if (!transcript || !transcript.trim()) {
     return res.status(400).json({ error: "Transcript data is required for summarizing." });
   }
@@ -938,11 +963,11 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
       // FFmpeg drawtext special chars: ' \ : must all be escaped.
       const ffmpegEscapeText = (t: string) =>
         t.replace(/\\/g, "\\\\")   // backslash → \\
-        .replace(/'/g, "\\'")     // single-quote → \'
-        .replace(/:/g, "\\:")     // colon → \:
-        .replace(/,/g, "\\,")     // comma → \,
-        .replace(/\[/g, "\\[")
-        .replace(/]/g, "\\]");
+          .replace(/'/g, "\\'")     // single-quote → \'
+          .replace(/:/g, "\\:")     // colon → \:
+          .replace(/,/g, "\\,")     // comma → \,
+          .replace(/\[/g, "\\[")
+          .replace(/]/g, "\\]");
       // Use the fontconfig font name – avoids Windows path escaping issues entirely.
       const FONT_NAME = "Arial";
 
@@ -968,7 +993,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
       if (clip.subtitles && clip.subtitles.length > 0) {
         for (const sub of clip.subtitles) {
           const startSec = timeToSeconds(sub.startTime).toFixed(3);
-          const endSec   = timeToSeconds(sub.endTime).toFixed(3);
+          const endSec = timeToSeconds(sub.endTime).toFixed(3);
           const safeSubText = ffmpegEscapeText(sub.text);
           // ✅ Correct: between(t,start,end) — no backslash-comma inside single-quoted value
           filterchain.push(
@@ -1046,7 +1071,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
 
             // Clean individual per-subtitle WAVs
             for (const f of subWavFiles) {
-              if (fs.existsSync(f.path)) try { fs.unlinkSync(f.path); } catch {}
+              if (fs.existsSync(f.path)) try { fs.unlinkSync(f.path); } catch { }
             }
           }
         } catch (audioErr: any) {
@@ -1071,7 +1096,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
           : `-an`;                                                                       // muted, no subtitles
 
       const ffmpegCmd = `${FFMPEG_PATH} -y -i "${rawClipPath}" ${audioArg} -filter_script "${filterFile}" -c:v libx264 -preset fast -b:v ${br}M -maxrate ${br}M -bufsize 12M -pix_fmt yuv420p "${finalClipPath}"`;
-      
+
       updateClipStatus(projectId, clipId, "encoding", 85);
       console.log(`[ReelGenie Render] FFmpeg command:\n${ffmpegCmd}`);
       await runCmd(ffmpegCmd);
@@ -1081,9 +1106,9 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
       }
 
       // Clean raw temp files
-      if (fs.existsSync(rawClipPath)) try { fs.unlinkSync(rawClipPath); } catch {}
-      if (fs.existsSync(filterFile)) try { fs.unlinkSync(filterFile); } catch {}
-      if (voiceTrackPath && fs.existsSync(voiceTrackPath)) try { fs.unlinkSync(voiceTrackPath); } catch {}
+      if (fs.existsSync(rawClipPath)) try { fs.unlinkSync(rawClipPath); } catch { }
+      if (fs.existsSync(filterFile)) try { fs.unlinkSync(filterFile); } catch { }
+      if (voiceTrackPath && fs.existsSync(voiceTrackPath)) try { fs.unlinkSync(voiceTrackPath); } catch { }
 
       // Complete successfully
       updateClipStatus(projectId, clipId, "completed", 100, `/output/shorts/short_${clipId}.mp4`);
@@ -1092,9 +1117,9 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
     } catch (e: any) {
       console.error(`[ReelGenie Render] Pipeline crashed for clip ${clipId}:`, e);
       updateClipStatus(projectId, clipId, "failed", 0);
-      
+
       // Cleanup files on error
-      if (fs.existsSync(rawClipPath)) try { fs.unlinkSync(rawClipPath); } catch {}
+      if (fs.existsSync(rawClipPath)) try { fs.unlinkSync(rawClipPath); } catch { }
     }
   })();
 
@@ -1183,8 +1208,8 @@ app.get("/api/download", async (req, res) => {
 // Implements the 3-step Reels publishing flow.
 // Returns instagramPostId on success, throws on failure.
 async function publishToInstagram(post: PostLog, publicVideoUrl: string): Promise<string> {
-  const IG_TOKEN   = process.env.INSTAGRAM_ACCESS_TOKEN || "";
-  const IG_USER_ID = process.env.INSTAGRAM_USER_ID     || "";
+  const IG_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN || "";
+  const IG_USER_ID = process.env.INSTAGRAM_USER_ID || "";
   const GRAPH_BASE = "https://graph.facebook.com/v19.0";
 
   if (!IG_TOKEN || !IG_USER_ID) {
@@ -1206,11 +1231,11 @@ async function publishToInstagram(post: PostLog, publicVideoUrl: string): Promis
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      media_type:    "REELS",
-      video_url:     publicVideoUrl,
-      caption:       captionText,
+      media_type: "REELS",
+      video_url: publicVideoUrl,
+      caption: captionText,
       share_to_feed: true,
-      access_token:  IG_TOKEN,
+      access_token: IG_TOKEN,
     })
   });
   const createData: any = await createRes.json();
@@ -1385,7 +1410,7 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { 
+      server: {
         middlewareMode: true,
         watch: {
           ignored: ['**/server-db.json']
