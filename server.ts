@@ -6,52 +6,56 @@ import { Readable } from "stream";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { extractClipAudio, transcribeClipAudio, translateSubtitles } from "./fireworksCaptioning";
+import { extractClipAudio, transcribeClipAudio, translateSubtitles, getGeminiClient, rotateGeminiKey } from "./fireworksCaptioning";
 
 // Load environment variables
 dotenv.config();
+
+const ai = !!process.env.GEMINI_API_KEY;
 
 const app = express();
 const PORT = 3000;
 app.use(express.json());
 
-// Initialize Gemini SDK safely
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-let ai: GoogleGenAI | null = null;
-if (GEMINI_API_KEY) {
-  ai = new GoogleGenAI({
-    apiKey: GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      }
-    }
-  });
-}
-
 // Safe Gemini generation runner with retry and fallback model capability
 async function generateContentWithRetry(params: any, retries = 2, delayMs = 600): Promise<any> {
-  if (!ai) throw new Error("Gemini AI instance is not configured.");
-
-  const modelToUse = params.model || "gemini-3.5-flash";
+  const modelToUse = params.model || "gemini-3.1-flash-lite";
   let lastError: any = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    let clientInfo;
+    try {
+      clientInfo = getGeminiClient(attempt);
+    } catch (e: any) {
+      throw new Error("Gemini AI instance is not configured: " + e.message);
+    }
+
+    const { client: currentAi, keyIndex, apiKey } = clientInfo;
+    const maskedKey = apiKey ? `${apiKey.substring(0, 6)}...` : 'none';
+
     try {
       if (attempt > 0) {
         // Sleep for exponential backoff duration
         const backoff = delayMs * Math.pow(2.5, attempt - 1);
         await new Promise((resolve) => setTimeout(resolve, backoff));
-        console.log(`Retrying Gemini request (attempt ${attempt + 1}/${retries + 1}) with model ${modelToUse}...`);
+        console.log(`Retrying Gemini request (attempt ${attempt + 1}/${retries + 1}) with model ${modelToUse} using API key index ${keyIndex}...`);
       }
-      return await ai.models.generateContent({
+      const response = await currentAi.models.generateContent({
         ...params,
         model: modelToUse
       });
+
+      // If we succeeded and we had rotated, let's update the default key index to this successful one
+      if (attempt > 0) {
+        for (let k = 0; k < attempt; k++) {
+          rotateGeminiKey();
+        }
+      }
+      return response;
     } catch (e: any) {
       lastError = e;
       const statusCode = e.status || (e.error && e.error.code) || (e.error && e.error.status) || 0;
-      console.warn(`Gemini generation attempt ${attempt + 1} failed (Status: ${statusCode}):`, e.message || e);
+      console.warn(`Gemini generation attempt ${attempt + 1} failed with key ${maskedKey} (Status: ${statusCode}):`, e.message || e);
 
       // If it's a 404 or 400 bad request, don't retry as it is a permanent parameter error
       if (statusCode === 404 || statusCode === 400) {
@@ -60,17 +64,27 @@ async function generateContentWithRetry(params: any, retries = 2, delayMs = 600)
     }
   }
 
-  // If we reach here, our primary model failed. Attempt fallback to gemini-3.1-flash-lite!
-  const fallbackModel = "gemini-3.1-flash-lite";
+  // If we reach here, our primary model failed. Attempt fallback to gemini-3.5-flash!
+  const fallbackModel = "gemini-3.5-flash";
   if (modelToUse !== fallbackModel) {
     console.log(`Switching to backup model "${fallbackModel}" due to outage/overload on "${modelToUse}"...`);
+    // Rotate the key index before trying fallback to give it a fresh key!
+    rotateGeminiKey();
+    let fallbackClientInfo;
     try {
-      return await ai.models.generateContent({
+      fallbackClientInfo = getGeminiClient(0);
+    } catch (e) {
+      throw lastError;
+    }
+    const { client: fallbackAi, keyIndex: fallbackIndex, apiKey: fallbackKey } = fallbackClientInfo;
+    const maskedFallbackKey = fallbackKey ? `${fallbackKey.substring(0, 6)}...` : 'none';
+    try {
+      return await fallbackAi.models.generateContent({
         ...params,
         model: fallbackModel
       });
     } catch (fallbackErr: any) {
-      console.error(`Fallback model "${fallbackModel}" also failed:`, fallbackErr.message || fallbackErr);
+      console.error(`Fallback model "${fallbackModel}" failed with key ${maskedFallbackKey}:`, fallbackErr.message || fallbackErr);
       throw lastError || fallbackErr;
     }
   }
@@ -380,7 +394,7 @@ app.post("/api/youtube/import", async (req, res) => {
       console.log("Noembed failed, invoking Gemini web search lookup as a high-fidelity lookup fallback...");
       try {
         const response = await generateContentWithRetry({
-          model: "gemini-3.5-flash",
+          model: "gemini-3.1-flash-lite",
           contents: `Use Google Search to find the ACTUAL, real video title, duration, and details of the YouTube video with link: "https://www.youtube.com/watch?v=${videoId}".
 Return the title and duration. DO NOT invent fake data if you cannot find it. Return a JSON holding: 'title' (exact search title), 'duration' (exact search duration).`,
           config: {
@@ -477,7 +491,7 @@ Return the title and duration. DO NOT invent fake data if you cannot find it. Re
   if (ai) {
     try {
       const response = await generateContentWithRetry({
-        model: "gemini-3.5-flash",
+        model: "gemini-3.1-flash-lite",
         contents: `Provide a short highly realistic viral video description and suggested tags for the video titled "${title}" (Duration: ${duration}). Keep the exact title without replacing it with standard mock video templates.`,
         config: {
           responseMimeType: "application/json",
@@ -687,7 +701,7 @@ app.post("/api/posts/suggest-captions", async (req, res) => {
   if (ai) {
     try {
       const response = await generateContentWithRetry({
-        model: "gemini-3.5-flash",
+        model: "gemini-3.1-flash-lite",
         contents: `You are a social media marketing expert for Instagram reels, TikTok, and YouTube shorts.
 The main video title is: "${title}". The clip focus is: "${clipName}". Topic: "${category || "general content"}".
 Generate structured, high-conversion caption drafts and 5 relevant trending hashtags to hook viewers.
@@ -760,7 +774,7 @@ app.post("/api/trending-audio", async (req, res) => {
   if (ai) {
     try {
       const response = await generateContentWithRetry({
-        model: "gemini-3.5-flash",
+        model: "gemini-3.1-flash-lite",
         contents: `Analyze this clip for social media video creators (Instagram Reels / YouTube Shorts).
 Video Title: "${title || "General Video"}"
 Clip Name: "${clipName || "My Clip"}"
@@ -830,7 +844,7 @@ app.post("/api/transcript/summary", async (req, res) => {
         : "Generate a concise video summary of exactly 2 to 3 sentences summarizing this transcript. Keep it highly cohesive, modern, professional, and suitable for social media captions or quick content previews.";
 
       const response = await generateContentWithRetry({
-        model: "gemini-3.5-flash",
+        model: "gemini-3.1-flash-lite",
         contents: `${instruction}\n\nTranscript Content:\n"${transcript}"`,
       });
 
@@ -967,14 +981,11 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
       ];
 
       // Helper: sanitise text so it is safe inside an FFmpeg drawtext filter.
-      // FFmpeg drawtext special chars: ' \ : must all be escaped.
+      // We replace single quotes with curly apostrophes (’) to avoid quote mismatches,
+      // and escape backslashes.
       const ffmpegEscapeText = (t: string) =>
         t.replace(/\\/g, "\\\\")   // backslash → \\
-          .replace(/'/g, "\\'")     // single-quote → \'
-          .replace(/:/g, "\\:")     // colon → \:
-          .replace(/,/g, "\\,")     // comma → \,
-          .replace(/\[/g, "\\[")
-          .replace(/]/g, "\\]");
+          .replace(/'/g, "’");     // single-quote → curly apostrophe (extremely safe & looks premium)
       // Use the fontconfig font name – avoids Windows path escaping issues entirely.
       const FONT_NAME = "Arial";
 
@@ -1004,7 +1015,7 @@ app.post("/api/projects/:projectId/clips/:clipId/render", (req, res) => {
           const safeSubText = ffmpegEscapeText(sub.text);
           // ✅ Correct: between(t,start,end) — no backslash-comma inside single-quoted value
           filterchain.push(
-            `drawtext=font='${FONT_NAME}':text='${safeSubText}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.75:boxborderw=8:x=(w-text_w)/2:y=h-130:enable='between(t\\,${startSec}\\,${endSec})'`
+            `drawtext=font='${FONT_NAME}':text='${safeSubText}':fontcolor=white:fontsize=42:box=1:boxcolor=black@0.75:boxborderw=8:x=(w-text_w)/2:y=h-130:enable='between(t,${startSec},${endSec})'`
           );
         }
         console.log(`[ReelGenie Render] Burning ${clip.subtitles.length} subtitle line(s) into clip.`);

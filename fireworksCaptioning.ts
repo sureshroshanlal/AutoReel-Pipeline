@@ -42,9 +42,46 @@ function secToClock(totalSeconds: number): string {
 
 // SRT timestamps look like 00:01:02,500 — convert to seconds
 function srtTimeToSeconds(t: string): number {
-  const [hms, ms] = t.trim().split(",");
-  const [hh, mm, ss] = hms.split(":").map(Number);
-  return hh * 3600 + mm * 60 + ss + (Number(ms || 0) / 1000);
+  const parts = t.trim().split(/[^0-9]/).filter(p => p !== "");
+  if (parts.length === 0) return 0;
+
+  if (parts.length === 4) {
+    const hh = Number(parts[0]);
+    const mm = Number(parts[1]);
+    const ss = Number(parts[2]);
+    const ms = Number(parts[3]);
+    return hh * 3600 + mm * 60 + ss + ms / 1000;
+  }
+
+  if (parts.length === 3) {
+    const lastPart = parts[2];
+    if (lastPart.length === 3 || Number(lastPart) > 59) {
+      const mm = Number(parts[0]);
+      const ss = Number(parts[1]);
+      const ms = Number(parts[2]);
+      return mm * 60 + ss + ms / 1000;
+    } else {
+      const hh = Number(parts[0]);
+      const mm = Number(parts[1]);
+      const ss = Number(parts[2]);
+      return hh * 3600 + mm * 60 + ss;
+    }
+  }
+
+  if (parts.length === 2) {
+    const lastPart = parts[1];
+    if (lastPart.length === 3) {
+      const ss = Number(parts[0]);
+      const ms = Number(parts[1]);
+      return ss + ms / 1000;
+    } else {
+      const mm = Number(parts[0]);
+      const ss = Number(parts[1]);
+      return mm * 60 + ss;
+    }
+  }
+
+  return Number(parts[0]) || 0;
 }
 
 /**
@@ -95,32 +132,164 @@ export async function extractClipAudio(
   return wavPath;
 }
 
+let currentKeyIndex = 0;
+
+/** Retrieves a Gemini client using key rotation. */
+export function getGeminiClient(attemptOffset = 0): { client: GoogleGenAI; keyIndex: number; apiKey: string } {
+  const keysStr = process.env.GEMINI_API_KEY || "";
+  const keys = keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) {
+    throw new Error("GEMINI_API_KEY is not set in .env");
+  }
+  const index = (currentKeyIndex + attemptOffset) % keys.length;
+  const apiKey = keys[index];
+  const client = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      }
+    }
+  });
+  return { client, keyIndex: index, apiKey };
+}
+
+/** Moves the starting key index forward by one. */
+export function rotateGeminiKey(): void {
+  const keysStr = process.env.GEMINI_API_KEY || "";
+  const keys = keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  if (keys.length > 0) {
+    currentKeyIndex = (currentKeyIndex + 1) % keys.length;
+  }
+}
+
 /**
- * Send a WAV file to Fireworks Whisper (whisper-v3-turbo, on AMD Instinct
- * GPUs) and get back real, timestamped subtitles as SRT, parsed into our
- * Subtitle[] shape.
+ * Send a WAV file to Google Gemini for transcription (with key rotation and fallbacks)
+ * and get back real, timestamped subtitles as SRT, parsed into our Subtitle[] shape.
  */
 export async function transcribeClipAudio(
   audioPath: string,
   opts: { language?: string } = {}
 ): Promise<Subtitle[]> {
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-  if (!GEMINI_API_KEY) {
+  const keysStr = process.env.GEMINI_API_KEY || "";
+  const keys = keysStr.split(",").map(k => k.trim()).filter(Boolean);
+  if (keys.length === 0) {
     throw new Error("GEMINI_API_KEY is not set in .env");
   }
 
-  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  const retries = 3;
+  const delayMs = 1000;
+  let lastError: any = null;
 
-  console.log(`[Gemini ASR] Uploading audio file for transcription: ${audioPath}`);
-  const uploadResult = await ai.files.upload({
-    file: audioPath,
-    config: {
-      mimeType: "audio/wav",
+  for (let attempt = 0; attempt < retries; attempt++) {
+    let clientInfo;
+    try {
+      clientInfo = getGeminiClient(attempt);
+    } catch (err: any) {
+      throw new Error("Gemini ASR client configuration failed: " + err.message);
     }
-  });
 
-  console.log(`[Gemini ASR] Generating SRT subtitles using gemini-3.5-flash...`);
+    const { client: ai, keyIndex, apiKey } = clientInfo;
+    const maskedKey = apiKey ? `${apiKey.substring(0, 6)}...` : 'none';
+    let uploadResult: any = null;
+
+    try {
+      if (attempt > 0) {
+        const backoff = delayMs * Math.pow(2.5, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        console.log(`[Gemini ASR] Retrying transcription (attempt ${attempt + 1}/${retries}) using key index ${keyIndex}...`);
+      }
+
+      console.log(`[Gemini ASR] Uploading audio file for transcription using key index ${keyIndex}: ${audioPath}`);
+      uploadResult = await ai.files.upload({
+        file: audioPath,
+        config: {
+          mimeType: "audio/wav",
+        }
+      });
+
+      console.log(`[Gemini ASR] Generating SRT subtitles using gemini-3.1-flash-lite on key index ${keyIndex}...`);
+      const response = await ai.models.generateContent({
+        model: "gemini-3.1-flash-lite",
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: `Please transcribe the audio and generate SRT formatted subtitles. 
+Ensure each subtitle block has:
+1. An index number (starting from 1)
+2. Start and end times in SRT format (HH:MM:SS,mmm)
+3. The transcribed text
+Ensure output is ONLY the raw SRT subtitle content. Do not include markdown code block formatting (e.g. \`\`\`srt) or any introductory/concluding text.`
+              },
+              {
+                fileData: {
+                  fileUri: uploadResult.uri,
+                  mimeType: uploadResult.mimeType,
+                }
+              }
+            ]
+          }
+        ]
+      });
+
+      let srtText = response.text || "";
+      srtText = srtText.trim();
+      if (srtText.startsWith("```")) {
+        srtText = srtText.replace(/^```[a-zA-Z]*\n/, "");
+        srtText = srtText.replace(/\n```$/, "");
+      }
+
+      console.log(`[Gemini ASR] ✅ Transcription generated successfully.`);
+
+      // Rotate keys permanently to the successful one
+      if (attempt > 0) {
+        for (let k = 0; k < attempt; k++) {
+          rotateGeminiKey();
+        }
+      }
+
+      // Cleanup uploaded file asynchronously
+      ai.files.delete({ name: uploadResult.name }).catch((err) => {
+        console.warn("[Gemini ASR] Failed to clean up file from Gemini workspace:", err.message || err);
+      });
+
+      return parseSrt(srtText);
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[Gemini ASR] Attempt ${attempt + 1} failed with key ${maskedKey}:`, err.message || err);
+
+      // Clean up file if uploaded on this key
+      if (uploadResult && uploadResult.name) {
+        ai.files.delete({ name: uploadResult.name }).catch(() => {});
+      }
+    }
+  }
+
+  // If primary model transcription failed entirely, we attempt fallback model: gemini-3.5-flash!
+  console.warn(`[Gemini ASR] Primary model transcription failed with all keys/retries. Attempting fallback model gemini-3.5-flash...`);
+  rotateGeminiKey();
+  let fallbackClientInfo;
   try {
+    fallbackClientInfo = getGeminiClient(0);
+  } catch (e) {
+    throw lastError;
+  }
+  const { client: ai, keyIndex, apiKey } = fallbackClientInfo;
+  const maskedKey = apiKey ? `${apiKey.substring(0, 6)}...` : 'none';
+  let uploadResult: any = null;
+
+  try {
+    console.log(`[Gemini ASR Fallback] Uploading audio using fallback client (key index ${keyIndex}): ${audioPath}`);
+    uploadResult = await ai.files.upload({
+      file: audioPath,
+      config: {
+        mimeType: "audio/wav",
+      }
+    });
+
+    console.log(`[Gemini ASR Fallback] Generating SRT using gemini-3.5-flash on key index ${keyIndex}...`);
     const response = await ai.models.generateContent({
       model: "gemini-3.5-flash",
       contents: [
@@ -153,42 +322,67 @@ Ensure output is ONLY the raw SRT subtitle content. Do not include markdown code
       srtText = srtText.replace(/\n```$/, "");
     }
 
-    console.log(`[Gemini ASR] ✅ Transcription generated successfully.`);
-    return parseSrt(srtText);
-  } finally {
-    // Cleanup uploaded file asynchronously to avoid taking up quota
+    console.log(`[Gemini ASR Fallback] ✅ Fallback transcription generated successfully.`);
+
     ai.files.delete({ name: uploadResult.name }).catch((err) => {
-      console.warn("[Gemini ASR] Failed to clean up file from Gemini workspace:", err.message || err);
+      console.warn("[Gemini ASR Fallback] Failed to clean up file from Gemini workspace:", err.message || err);
     });
+
+    return parseSrt(srtText);
+  } catch (err: any) {
+    if (uploadResult && uploadResult.name) {
+      ai.files.delete({ name: uploadResult.name }).catch(() => {});
+    }
+    console.error(`[Gemini ASR Fallback] Fallback model also failed with key ${maskedKey}:`, err.message || err);
+    throw lastError || err;
   }
 }
 
 /** Parse standard SRT text into our Subtitle[] shape. */
 function parseSrt(srt: string): Subtitle[] {
-  const blocks = srt
-    .replace(/\r/g, "")
-    .split(/\n\n+/)
-    .map((b) => b.trim())
-    .filter(Boolean);
-
+  const lines = srt.replace(/\r/g, "").split("\n").map(l => l.trim());
   const subtitles: Subtitle[] = [];
 
-  for (const block of blocks) {
-    const lines = block.split("\n");
-    // lines[0] = index, lines[1] = "00:00:01,000 --> 00:00:04,000", rest = text
-    const timeLine = lines[1];
-    if (!timeLine || !timeLine.includes("-->")) continue;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.includes("-->")) {
+      const timeLine = line;
+      const [startRaw, endRaw] = timeLine.split("-->").map(s => s.trim());
 
-    const [startRaw, endRaw] = timeLine.split("-->").map((s) => s.trim());
-    const text = lines.slice(2).join(" ").trim();
-    if (!text) continue;
+      const textLines: string[] = [];
+      let j = i + 1;
+      while (j < lines.length) {
+        const nextLine = lines[j];
+        if (!nextLine) {
+          break;
+        }
+        if (nextLine.includes("-->")) {
+          if (textLines.length > 0) {
+            if (/^\d+$/.test(textLines[textLines.length - 1])) {
+              textLines.pop();
+            }
+          }
+          j--;
+          break;
+        }
+        textLines.push(nextLine);
+        j++;
+      }
 
-    subtitles.push({
-      id: `s_fw_${Date.now()}_${subtitles.length}`,
-      startTime: secToClock(srtTimeToSeconds(startRaw)),
-      endTime: secToClock(srtTimeToSeconds(endRaw)),
-      text,
-    });
+      const text = textLines.join(" ").trim();
+      if (text) {
+        subtitles.push({
+          id: `s_fw_${Date.now()}_${subtitles.length}`,
+          startTime: secToClock(srtTimeToSeconds(startRaw)),
+          endTime: secToClock(srtTimeToSeconds(endRaw)),
+          text,
+        });
+      }
+      i = j + 1;
+    } else {
+      i++;
+    }
   }
 
   return subtitles;
@@ -210,7 +404,7 @@ export async function translateSubtitles(
 
   const prompt = `Translate each of the following short video caption lines into ${targetLanguage}.
 Keep translations short, punchy, and natural for social media captions — do not translate literally word-for-word if a more natural phrasing exists.
-Return ONLY a JSON array of strings, same length and order as the input, no extra commentary.
+Return ONLY a JSON object of the form {"translations": ["line1", "line2", ...]}, with exactly ${subtitles.length} strings in the same order as the input. No extra commentary.
 
 Input lines:
 ${JSON.stringify(subtitles.map((s) => s.text))}`;
@@ -235,14 +429,18 @@ ${JSON.stringify(subtitles.map((s) => s.text))}`;
   }
 
   const data: any = await res.json();
-  const raw = data?.choices?.[0]?.message?.content || "[]";
+  const raw = data?.choices?.[0]?.message?.content || "{}";
 
   let translated: string[];
   try {
     const parsed = JSON.parse(raw);
     // Model may wrap the array in an object; handle both shapes defensively.
     translated = Array.isArray(parsed) ? parsed : parsed.translations || parsed.lines || [];
-  } catch {
+    if (translated.length === 0) {
+      console.warn(`[Fireworks Localize] Parsed response had no usable translations. Raw content: ${raw}`);
+    }
+  } catch (e) {
+    console.error(`[Fireworks Localize] Failed to parse model response as JSON. Raw content: ${raw}`);
     translated = [];
   }
 

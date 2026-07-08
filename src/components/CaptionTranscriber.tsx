@@ -41,7 +41,7 @@ export default function CaptionTranscriber({
     );
   }
 
-  // Trigger ASMR/Whisper Transcription via Backend proxying to server-side Gemini 3.5 Flash
+  // Trigger ASMR/Whisper Transcription via Backend proxying to server-side Gemini 3.1 Flash Lite
   const triggerTranscription = async () => {
     setTranscribing(true);
     try {

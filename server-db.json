@@ -1,25 +1,25 @@
 {
   "projects": [
     {
-      "id": "project_7bvs8kjca",
-      "youtubeUrl": "https://www.youtube.com/watch?v=Fiq9XMRr4jg",
-      "title": "i met ronaldo 🇵🇹",
-      "thumbnailUrl": "https://i.ytimg.com/vi/Fiq9XMRr4jg/hqdefault.jpg",
+      "id": "project_mvdj8aya8",
+      "youtubeUrl": "https://www.youtube.com/watch?v=3KYw8jri5Gg",
+      "title": "Argentina vs  Egypt Messi Jst missed  penalty 😭😭#messi #Argentina #Egypt #2026 #worldcup ",
+      "thumbnailUrl": "https://i.ytimg.com/vi/3KYw8jri5Gg/hqdefault.jpg",
       "duration": "14:22",
       "clips": [
         {
-          "id": "clip_135c8hyt2",
-          "name": "Short Clip #1",
-          "startTime": "00:00:00",
-          "endTime": "00:00:15",
+          "id": "clip_5gvpsn6ii",
+          "name": "Short Clip #2",
+          "startTime": "00:00:03",
+          "endTime": "00:00:29",
           "verticalCrop": {
-            "x": 50,
+            "x": 30,
             "y": 50,
-            "zoom": 1.2,
+            "zoom": 1.1,
             "colorCorrection": {
-              "brightness": 0,
-              "contrast": 0,
-              "saturation": 0
+              "brightness": 21,
+              "contrast": 18,
+              "saturation": 13
             }
           },
           "backgroundMusic": "None - Retain Original Audio",
@@ -28,23 +28,41 @@
           "status": "completed",
           "subtitles": [
             {
-              "id": "s_fw_1783416694146_0",
-              "startTime": "00:00:01",
-              "endTime": "00:00:04",
-              "text": "No way !"
+              "id": "s_fw_1783444255105_0",
+              "startTime": "00:00:02",
+              "endTime": "00:00:06",
+              "text": "Yeah, I believe. The issue is Australia really didn't score any in the game, so..."
             },
             {
-              "id": "s_fw_1783416694146_1",
-              "startTime": "00:00:07",
-              "endTime": "00:00:09",
-              "text": "Vas-y, vas-y."
+              "id": "s_fw_1783444255106_1",
+              "startTime": "00:00:06",
+              "endTime": "00:00:10",
+              "text": "...don't think that's going to worry him too much."
+            },
+            {
+              "id": "s_fw_1783444255106_2",
+              "startTime": "00:00:10",
+              "endTime": "00:00:15",
+              "text": "Obviously, he's in an ideal position and you'd expect Messi to put this away."
+            },
+            {
+              "id": "s_fw_1783444255106_3",
+              "startTime": "00:00:16",
+              "endTime": "00:00:23",
+              "text": "Lionel Messi to score for the ninth consecutive match of the World Cup finals."
+            },
+            {
+              "id": "s_fw_1783444255106_4",
+              "startTime": "00:00:23",
+              "endTime": "00:00:26",
+              "text": "No, he can't! But he did anyway!"
             }
           ],
           "progress": 100,
-          "outputUrl": "/output/shorts/short_clip_135c8hyt2.mp4"
+          "outputUrl": "/output/shorts/short_clip_5gvpsn6ii.mp4"
         }
       ],
-      "createdAt": "2026-07-07T08:34:43.254Z"
+      "createdAt": "2026-07-07T17:08:23.363Z"
     }
   ],
   "posts": [],

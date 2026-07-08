@@ -344,7 +344,7 @@ export default function App() {
             </button>
             <span className="h-6 w-px bg-white/10 hidden md:block" />
             <div className="text-[11px] text-slate-400 font-medium bg-white/5 border border-white/10 px-3 py-1.5 rounded-xl">
-              Model: <span className="font-bold text-white">Gemini 3.5 Flash</span>
+              Model: <span className="font-bold text-white">Gemini 3.1 Flash Lite</span>
             </div>
           </div>
         </div>
